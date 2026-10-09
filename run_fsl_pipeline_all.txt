@@ -1,0 +1,110 @@
+#!/bin/bash
+
+for subj in s1; do
+    echo "Processing subject $subj ..."
+
+    # --- Structural Preprocessing ---
+    # 1. Bias field correction
+    fast -B -o ${subj}_t1mprg_bias ${subj}_t1mprage.nii.gz
+
+    # 2. Brain extraction
+    bet ${subj}_t1mprg_bias_restore.nii.gz ${subj}_t1mprg_brain.nii.gz -f 0.3 -R
+
+    # 3. Linear registration (brain-extracted images)
+    flirt -in ${subj}_t1mprg_brain.nii.gz \
+          -ref /home/lius/fsl/data/standard/MNI152_T1_2mm_brain.nii.gz \
+          -omat ${subj}_t1_to_MNI.mat \
+          -dof 12
+
+    # 4. Nonlinear refinement (use original T1, not brain-extracted)
+    fnirt --in=${subj}_t1mprg_bias_restore.nii.gz \
+          --aff=${subj}_t1_to_MNI.mat \
+          --config=T1_2_MNI152_2mm \
+          --iout=${subj}_t1mprg_MNI.nii.gz \
+          --cout=${subj}_t1_to_MNI_warp
+
+    # --- Functional Preprocessing and Analysis ---
+    for modality in motor_epi; do
+        echo "  Processing $modality ..."
+
+        # 1. Extract reference volume (first volume)
+        fslroi ${subj}_${modality}.nii.gz ${subj}_${modality}_ref.nii.gz 0 1
+
+        if [[ "$modality" == motor_epi ]]; then
+        # 2. EPI-to-T1 registration (rigid-body, mutual information)
+              flirt -in ${subj}_${modality}_ref.nii.gz -ref ${subj}_t1mprg_brain.nii.gz \
+                    -omat ${subj}_${modality}_to_t1.mat -dof 6 -cost normmi
+        fi
+
+        if [[ "$modality" == motor_zte || "$modality" == motor_hc ]]; then
+        # 2.1. ZTE-to-T1 registration (rigid-body, mutual information),ZTE needs to be coreg with whole mprg, not bet
+              flirt -in ${subj}_${modality}_ref.nii.gz -ref ${subj}_t1mprg_bias_restore.nii.gz \
+                    -omat ${subj}_${modality}_to_t1.mat -dof 12 -cost normmi
+        fi
+
+        # 3. Combine transformations: EPI -> T1 -> MNI
+        convertwarp -r /home/lius/fsl/data/standard/MNI152_T1_2mm.nii.gz \
+                    -o ${subj}_${modality}_to_MNI_warp.nii.gz \
+                    --premat=${subj}_${modality}_to_t1.mat \
+                    --warp1=${subj}_t1_to_MNI_warp.nii.gz
+
+        # 4. Apply warp to full 4D data
+        applywarp -i ${subj}_${modality}.nii.gz \
+                  -r /home/lius/fsl/data/standard/MNI152_T1_2mm.nii.gz \
+                  -w ${subj}_${modality}_to_MNI_warp.nii.gz \
+                  -o ${subj}_${modality}_MNI.nii.gz
+
+        # 5. MNI-space masking (using standard brain mask)
+        fslmaths ${subj}_${modality}_MNI.nii.gz \
+                 -mas /home/lius/fsl/data/standard/MNI152_T1_2mm_brain_mask.nii.gz \
+                 ${subj}_${modality}_MNI_masked.nii.gz
+
+        # 6. Motion Correction
+        mcflirt -in ${subj}_${modality}_MNI_masked.nii.gz -out ${subj}_${modality}_mc.nii.gz
+
+        # 7. Spatial Smoothing (5 mm FWHM ≈ 2.123 mm sigma)
+        fslmaths ${subj}_${modality}_mc.nii.gz -s 2.123 ${subj}_${modality}_smooth.nii.gz
+
+        # 8. Temporal Highpass Filtering (50 s cutoff)
+        # fslmaths ${subj}_${modality}_smooth.nii.gz -bptf 50 -1 ${subj}_${modality}_filtered.nii.gz
+        fslmaths ${subj}_${modality}_smooth.nii.gz -bptf 16.67 -1 ${subj}_${modality}_filtered.nii.gz
+
+        # 9. GLM Analysis (only for task-based data)
+        if [[ "$modality" == motor_epi || "$modality" == motor_zte || "$modality" == motor_hc ]]; then
+            fsl_glm -i ${subj}_${modality}_filtered.nii.gz \
+                    -d design_${modality}.mat \
+                    --demean \
+                    -o stats_${subj}_${modality}_glm.nii.gz \
+                    --out_res=residuals_${subj}_${modality}.nii.gz \
+                    --out_z=zstats_${subj}_${modality}.nii.gz \
+                    --out_cope=cope_${subj}_${modality}.nii.gz \
+                    --out_varcb=varcope_${subj}_${modality}.nii.gz
+        fi
+
+        # 10. ICA Analysis (all modalities)
+
+	#if [[ "$modality" == rs_epi || "$modality" == rs_zte ]]; then
+	#melodic --in=${subj}_${modality}_filtered.nii.gz \
+        #        --outdir=${subj}_${modality}_filtered_ica \
+        #        --tr=3.0 \
+        #        --nobet \
+        #        --mmthresh=0.5 \
+        #        --Oall \
+        #        -d 60
+	#fi
+
+       # melodic --in=${subj}_${modality}_smooth.nii.gz \
+       #        --outdir=${subj}_${modality}_nofilter_ica \
+       #         --tr=3.0 \
+       #         --nobet \
+       #         --mmthresh=0.5 \
+       #         --Oall \
+       #         -d 60
+
+        echo "  $modality done."
+    done
+
+    echo "Subject $subj done."
+done
+
+
